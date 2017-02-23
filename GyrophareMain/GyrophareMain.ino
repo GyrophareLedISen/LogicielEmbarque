@@ -1,163 +1,282 @@
-/*
- * Programme Gyrophare ISEN
- * 
- * Benoit PIRIOU & Rudja RULLE
- * 
- * Decembre 2016 - Fevrier 2017
- */
-
-//--Mode d'execution--//
-
-#define TEST_MODE 0
-#define CLASSIC_MODE 1
-
-
-#include "EclairageBleu.h"
-//#include "Bluetooth.h"
-
 #include <SoftwareSerial.h>
-
-//Include for ledMatrix
-#include <SPI.h>
 #include "bitBangedSPI.h"
 #include "MAX7219_Dot_Matrix.h"
+#include "Gyro.h"
+#include "Led_display.h"
+#include "Sirene.h"
+#include "Bluetooth.h"
 
-//Initialization des ports pour la communication bluetooth
-SoftwareSerial mySerial(7, 8); // RX, TX
+const int rx = 8;
+const int tx = 7;
+SoftwareSerial mySerial(rx,tx); // RX, TX
 
-//Initialisation de l'écran d'affichage myDisplay(nombre de max, LOAD, DIN, CLK)
-MAX7219_Dot_Matrix myDisplay (4, 12, 13, 11);
+// Déclarer les états possibles et la variable qui va mémoriser l'état courant
+enum { 
+  GYRO, 
+  LED_DISPLAY, 
+  SIRENE,
+  DEFAULT_MODE,
+  BLUETOOTH,
+  OTHER 
+  } State = GYRO;
+// GYRO : on allume une rangée de LED sur le gyrophare
+// LED : on fait avancer d'un cran le texte sur la matrice à LED
+// SIRENE : on fais fonctionner la sirène
+// DEFAULT_MODE : mode de configuration par défault
+// OTHER : autre mode en cas de besoin
 
+//************ALL GLOBAL VARIABLES******************
+//Led display variables
+const String defaultText = "Police\n"; //OK
+bool defaultMode = true;
 int TailleTexte = 20;
 int avanceText = 0;
+String textToShow = "";
+const int numberMax = 4;
+const int load = 12;
+const int din = 13;
+const int clk = 11;
+//Initialisation de l'écran d'affichage myDisplay(nombre de max, LOAD, DIN, CLK)
+MAX7219_Dot_Matrix myDisplay (numberMax, load, din, clk);
 
-int ledToSwitchOn = 1; 
-int maxLedToSwitchOn = 2048;
+//Sirene variables
+const int button_On_Off_Sirene = 21;
+int sensorReading;
+int stateButtonSirene;
+bool stateSirene = false;
+const int Sirene_pin = 9;
 
-//Gestion de la machine d'état
+//Gyro variables
+const int button_Animation = 20;
+//To check how many time we pressed the animation button
+int stateButtonAnimation;
+int lastButtonStateAnimation = 0;
+int buttonPushCounter = 0;   // counter for the number of button presses
+
+//Animation variables
+int animation1[] = {1,2,4,8,16,32,64,128,256,512,1024,2048};
+int animation2[] = {63,4095,4032,4095};
+int animation3[] = {3591,0,504,0};
+int animation4[] = {4095,2046,1020,504,240,96,240,504,1020,2046,4095,3999,3855,3591,3075,2049,0};
+
+//Time variables
 long previousMillisText = 0;
 long previousMillisGyro = 0;
-
-//Ici on définit le temps qu'il faut attendre avant de faire avancer d'un cran le programme
-//Exemple il faut ici qu'il y ai eu 25 ms avant d'allumer la prochaine rangée de LED
-long intervalText = 100;
+long previousMillisSirene = 0;
+long intervalText = 100; //anciennement : 100
 long intervalGyro = 25;
+long intervalSirene = 1000;
 
-const char * text = "";
-String textToShow = "";
-String inString = "";
+//ALL CONSTANTS VARIABLES
+const int ledSirene = 6;
+const int ledDefault = 5;
+const int cmd_delay = 50;
 
-//Setup for SIRENE
-unsigned int frequency = 40; //An example. The min frequency on UNO is 31!
-unsigned long durationTone = 1000; //Also an example
+//Temporary variable
+int incrementAnim1 = 0;
+int incrementAnim2 = 0;
 
-void setup() {
+void setup()
+{
         Serial.begin(57600);
         while (!Serial) {
-          ; // wait for serial port to connect. Needed for native USB port only
+            ; // wait for serial port to connect. Needed for native USB port only
         }
-        //--SetupTextToShow--//
+        //--SetupLedDisplay--//
         myDisplay.begin ();
-        myDisplay.sendSmooth ("Hello ISEN",0);
-          
+        for (int i = 0; i < 25; i++) {
+          //Je suis obligé de mettre ce mot en majuscule pour que l'initialisation
+          //se fasse correctement! Je ne sais pas pourquoi...
+          myDisplay.sendSmooth("POLICE", i);
+        }
+        myDisplay.end();
+        myDisplay.begin();
+
         //--SetupEclairage--//
         pinMode(2, OUTPUT); //latchPin
         pinMode(3, OUTPUT); //ClockPin
         pinMode(4, OUTPUT); //DataPin
-        pinMode(16,OUTPUT); //16
-        pinMode(17,OUTPUT); //1
-        pinMode(18,OUTPUT); //18
-        pinMode(19,OUTPUT); //19
+        pinMode(16,OUTPUT); //16 A2 OK      
+        pinMode(17,OUTPUT); //17 A3 OK
+        pinMode(18,OUTPUT); //18 A4 OK
+        pinMode(19,OUTPUT); //19 A5 OK
 
         //--SetupButton--//
-        pinMode(9, INPUT); //BUTTON2. Je ne me souviens plus de l'entrée donc j'ai mis 9 en attendant
-
+        pinMode(button_On_Off_Sirene, INPUT); //BUTTON2. Je ne me souviens plus de l'entrée donc j'ai mis 9 en attendant
+        pinMode(button_Animation, INPUT); //BUTTON1.
+        
+        //--SetupLED--//
+        pinMode(ledSirene,OUTPUT); //Led associate to button2
+        
         // set the data rate for the SoftwareSerial port
-        mySerial.begin(9600);
-        mySerial.println("Hello, world?");
+        //Don't change the rate!!!!
+        //mySerial.begin(115200);
+        mySerial.begin(115200);
+        State = GYRO;
+        Serial.println("Gyrophare ISEN : INITIALISATION OK");
 }
 
-void loop() {
+//Remarques
+//Lorsque l'arduino est alimenté uniquement par le générateur, 
+//la partie bluetooth ne fonctionne plus. 
+//Il faut que j'alimente obligatoirement la maquette avec le générateur ET mon ordinateur
+//pour que le programme puisse tourner plus de 2 minutes!!
+ 
+void loop()
+{
+  unsigned long currentMillis = millis();
 
-  if (!mySerial.available()) {
-          //Initialisation 
-          unsigned long currentMillis = millis();
-          
-          if (currentMillis - previousMillisGyro > intervalGyro) {
-            previousMillisGyro = currentMillis;
-            //APPEL DU PROGRAMME GYRO
-            if (ledToSwitchOn <= maxLedToSwitchOn)
-            {
-              AnimationBleu(1,0, ledToSwitchOn);
-              ledToSwitchOn = ledToSwitchOn *2;
-            } else {
-              ledToSwitchOn = 1;
-            }
-          }else if (currentMillis - previousMillisText > intervalText) {
-            previousMillisText = currentMillis;
-            if (avanceText<TailleTexte){
-              
-              // Length (with one extra character for the null terminator)
-              int str_len = textToShow.length(); 
+  //Read sirene button
+  sensorReading = analogRead(button_On_Off_Sirene);
+  stateButtonSirene = map(sensorReading, 0, 950, 0, 1);
 
-              //Rewrite of TailleText to have all the String on the LCD
-              //*********************TO DO****************************
-              
-              // Prepare the character array (the buffer) 
-              char char_array[str_len];
+  //Read button animation (button1)
+  sensorReading = analogRead(button_Animation);
+  stateButtonAnimation = map(sensorReading, 0, 950, 0, 1);
 
-              //Convert string into charArray
-              textToShow.toCharArray(char_array, str_len);
-              
-              myDisplay.sendSmooth (char_array,avanceText);
-              avanceText++;
-            }else {
-              avanceText=0;
-            }
-          }else if (digitalRead(9)){
-              //Si le bouton de la sirene est allumé
-              //A tester!!!!!
-              //If duration is specified, we don't need to call a "noTone" function. 
-              //tone(9,frequency,durationTone);
-              tone(9,frequency);
-          } else if (!digitalRead(9)) {
-              //Si le bouton de la sirene est éteint
-              noTone(9);
-          }
-
-  } else {
-          char inChar = mySerial.read();
-          inString += inChar;     
-
-          //Apparemment le inChar == '\n' ne fonctionne pas! 
-          //Je compare donc par rapport aux valeurs décimales des symboles
-          //correspondant à la fin de ligne (cf https://fr.wikipedia.org/wiki/Fin_de_ligne)
-          if (inChar == 13 || inChar == 10) {
-            Serial.print("String:");
-            Serial.print(inString);
-            Serial.println("EndString");
-
-            //Desfois le module bluetooth sauvegarde une chaine de caractère vide
-            //Il faut dans ce cas retaper la chaine jusqu'à ce que cette dernière 
-            //soit prise en compte
-            //Avec la fonction ci-dessus, je vais vérifier si la chaine est vide 
-            //et décider de l'enregistrer ou pas. 
-            
-            /*if (inString != '\0' || inString != '\n') {
-              Serial.println("WRITE");
-              textToShow = inString;
-            }*/
-
-            //Gestion de la longueur de la chaine à afficher.
-            //En fonction de la longueur de la chaine, je modifie la variable 
-            //"TailleTexte". Cette dernière détermine le nombre de fois que l'écran
-            //doit avancer d'un cran pour afficher l'ensemble de la chaine. 
-            int str_len = textToShow.length(); 
-            TailleTexte = (str_len * 6);
-            
-            textToShow = inString;
-            // clear the string for new input:
-            inString = "";
-          }
-  } 
+  //Calcul length of default text
+  TailleTexte = calculation_Length_of_String(defaultText);
+  
+  //Decision state
+  if (!mySerial.available()) 
+  {
+    
+  } else { //mySerial.available() = 1
+     State = BLUETOOTH;
+  }
+  
+  switch (State)
+  {
+    case GYRO:
+      //Action
+      //Test timer si test timer ==1 je fais gyro 
+      if (currentMillis - previousMillisGyro > intervalGyro) {
+        previousMillisGyro = currentMillis;
+        //Serial.println("Gyro_STATE");
+        if (stateButtonAnimation == 1){
+        //if (buttonChoiceAnimation()){  
+          if (incrementAnim1 <= (sizeof(animation1)/sizeof(int))){
+            AnimationBleu(1,0,animation1[incrementAnim1]);
+            incrementAnim1++;
+          } else {
+            incrementAnim1 = 0;
+          }        
+        } else { 
+          //stateButtonAnimation == 0
+          if (incrementAnim2 <= (sizeof(animation2)/sizeof(int))){
+            AnimationBleu(1,0,animation2[incrementAnim2]);
+            incrementAnim2++;
+          } else {
+            incrementAnim2 = 0;
+          }         
+        }
+      }
+      State = LED_DISPLAY;
+      break;
+    case LED_DISPLAY:
+      //Action
+      if (currentMillis - previousMillisText > intervalText) {
+        previousMillisText = currentMillis;
+        //Serial.println("Led_Display_STATE");
+        if (avanceText < TailleTexte){
+          if (defaultMode == true){
+            digitalWrite(ledDefault, HIGH);
+            avanceText = Led_Display_Programme(avanceText,defaultText,&myDisplay);
+          } else {
+            digitalWrite(ledDefault, LOW);
+            avanceText = Led_Display_Programme(avanceText,textToShow,&myDisplay);
+          } 
+        } else {
+            avanceText=0;
+        }   
+      }
+      State = SIRENE;
+      break;
+    case SIRENE:
+      //Action
+      if ((currentMillis - previousMillisSirene > intervalSirene) && (stateButtonSirene == 0)) {
+        previousMillisSirene = currentMillis; 
+        digitalWrite(ledSirene, HIGH);
+        Serial.println("Sirene_STATE");
+        if (stateSirene == false){
+          stateSirene = Sirene_Program(stateSirene, Sirene_pin);
+        } else {
+          stateSirene = Sirene_Program(stateSirene, Sirene_pin);
+        }
+      }
+      if (stateButtonSirene == 1){
+        digitalWrite(ledSirene, LOW);
+        noTone(Sirene_pin);
+      }
+      State = GYRO;
+      break;
+    case BLUETOOTH:
+      //Action
+      Serial.println("Bluetooth_STATE!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!");
+      defaultMode = false;
+      textToShow =  Bluetooth_Program(textToShow, &mySerial);
+      
+      //Update of TailleTexte variable
+      TailleTexte = calculation_Length_of_String(textToShow);
+      State = GYRO;
+      break;
+    case OTHER:
+      //Action
+      //You can add an other function here! 
+      break;
+    }  
 }
+
+//delay_Function in case of
+boolean delay_Function () {
+    delay(cmd_delay);
+    return true;
+}
+
+int calculation_Length_of_String (String text) {
+    //Gestion de la longueur de la chaine à afficher.
+    //En fonction de la longueur de la chaine, je modifie la variable 
+    //"TailleTexte". Cette dernière détermine le nombre de fois que l'écran
+    //doit avancer d'un cran pour afficher l'ensemble de la chaine. 
+    int str_len = text.length(); 
+    return (str_len * 6);
+}
+
+/*bool buttonChoiceAnimation(){
+    //Read button animation (button1)
+  sensorReading = analogRead(button_Animation);
+  stateButtonAnimation = map(sensorReading, 0, 950, 0, 1);
+
+    if (stateButtonAnimation != lastButtonStateAnimation) {
+      // if the state has changed, increment the counter
+      if (stateButtonAnimation == 1) {
+        // if the current state is HIGH then the button
+        // wend from off to on:
+        buttonPushCounter++;
+        //Serial.println("on");
+        //Serial.print("number of button pushes:  ");
+        //Serial.println(buttonPushCounter);
+      } else {
+        // if the current state is LOW then the button
+        // wend from on to off:
+        //Serial.println("off");
+      }
+      // Delay a little bit to avoid bouncing
+      //delay(50);
+    }
+    // save the current state as the last state,
+    //for next time through the loop
+    lastButtonStateAnimation = stateButtonAnimation;
+
+    // turns on the LED every four button pushes by
+    // checking the modulo of the button push counter.
+    // the modulo function gives you the remainder of
+    // the division of two numbers:
+    if (buttonPushCounter % 2 == 0) {
+      return true;
+    } else {
+      return false;
+    }
+}*/
+
+
